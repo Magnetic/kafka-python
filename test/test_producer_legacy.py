@@ -7,6 +7,7 @@ import time
 
 from mock import MagicMock, patch
 from test import unittest
+from test.testutil import DisableUnsentStoringMixin
 
 from kafka import SimpleClient, SimpleProducer, KeyedProducer
 from kafka.errors import (
@@ -120,9 +121,10 @@ class TestKafkaProducer(unittest.TestCase):
             self.assertEqual(mocked_stop.call_count, 1)
 
 
-class TestKafkaProducerSendUpstream(unittest.TestCase):
+class TestKafkaProducerSendUpstream(DisableUnsentStoringMixin, unittest.TestCase):
 
     def setUp(self):
+        super(TestKafkaProducerSendUpstream, self).setUp()
         self.client = MagicMock()
         self.queue = queue.Queue()
 

@@ -70,6 +70,11 @@ def _get_pending_messages():
         return []
 
 
+def _store_unsent_messages(failed_msgs):
+    with open(KAFKA_UNSENT_FILE, 'w') as f:
+        json.dump(failed_msgs[:FAILED_MSGS_MAXSIZE], f)
+
+
 @synchronized
 def _send_upstream(
         queue, client, codec, batch_time, batch_size,
@@ -176,6 +181,8 @@ def _send_upstream(
                 val = next(all_messages)
                 try:
                     topic_partition, msg, key = val
+                    print("Extracted row, {}, {}, {}".format(topic_partition, msg, key))
+                    print('queue size: {}'.format(queue.qsize()))
                 except ValueError:
                     print("Val: {}".format(val))
                     raise
@@ -303,8 +310,7 @@ def _send_upstream(
                      orig_req.messages if log_messages_on_error
                                        else hash(orig_req.messages))
 
-    with open(KAFKA_UNSENT_FILE, 'w') as f:
-        json.dump(failed_msgs[:FAILED_MSGS_MAXSIZE], f)
+    _store_unsent_messages(failed_msgs)
 
     if request_tries or not queue.empty():
         log.error('Stopped producer with %d unsent messages', len(request_tries) + queue.qsize())

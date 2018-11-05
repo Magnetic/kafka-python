@@ -6,6 +6,7 @@ import os
 import socket
 import time
 import uuid
+import mock
 
 import pytest
 from test import unittest
@@ -65,6 +66,7 @@ def kafka_versions(*versions):
 
     return real_kafka_versions
 
+
 def get_open_port():
     sock = socket.socket()
     sock.bind(("", 0))
@@ -72,7 +74,10 @@ def get_open_port():
     sock.close()
     return port
 
+
 _MESSAGES = {}
+
+
 def msg(message):
     """Format, encode and deduplicate a message
     """
@@ -81,6 +86,7 @@ def msg(message):
         _MESSAGES[message] = '%s-%s' % (message, str(uuid.uuid4()))
 
     return _MESSAGES[message].encode('utf-8')
+
 
 def send_messages(client, topic, partition, messages):
     """Send messages to a topic's partition
@@ -91,6 +97,7 @@ def send_messages(client, topic, partition, messages):
     assert resp.error == 0
 
     return [x.value for x in messages]
+
 
 def current_offset(client, topic, partition, kafka_broker=None):
     """Get the current offset of a topic's partition
@@ -105,6 +112,7 @@ def current_offset(client, topic, partition, kafka_broker=None):
         raise
     else:
         return offsets.offsets[0]
+
 
 class KafkaIntegrationTestCase(unittest.TestCase):
     create_client = True
@@ -192,3 +200,39 @@ class Timer(object):
     def __exit__(self, *args):
         self.end = time.time()
         self.interval = self.end - self.start
+
+
+class DisableUnsentStoringMixin(object):
+    original_get_pending_messages_fn = None
+    get_pending_msgs_patcher = None
+
+    original_get_store_unsent_messages_fn = None
+    store_unsent_msgs_patcher = None
+
+    MOCK_PROCESSING_UNSENT_MSGS = True
+
+    def setUp(self):
+        super(DisableUnsentStoringMixin, self).setUp()
+        if not self.MOCK_PROCESSING_UNSENT_MSGS:
+            return
+
+        from kafka.producer.base import _get_pending_messages
+        self.original_get_pending_messages_fn = _get_pending_messages
+        self.get_pending_msgs_patcher = mock.patch('kafka.producer.base._get_pending_messages')
+        get_pending_msgs_mock = self.get_pending_msgs_patcher.start()
+        get_pending_msgs_mock.return_value = []
+
+        from kafka.producer.base import _store_unsent_messages
+        self.original_get_store_unsent_messages_fn = _store_unsent_messages
+        self.store_unsent_msgs_patcher = mock.patch('kafka.producer.base._store_unsent_messages')
+        self.store_unsent_msgs_patcher.start()
+
+    def tearDown(self):
+        super(DisableUnsentStoringMixin, self).tearDown()
+        if not self.MOCK_PROCESSING_UNSENT_MSGS:
+            return
+
+        self.store_unsent_msgs_patcher.stop()
+        self.get_pending_msgs_patcher.stop()
+
+
