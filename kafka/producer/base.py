@@ -2,12 +2,12 @@ from __future__ import absolute_import
 
 import functools
 import itertools
-import itertools
 import atexit
 import logging
 import time
 import json
 from datetime import datetime as dtime, timedelta
+import sys
 
 try:
     from queue import Empty, Full, Queue  # pylint: disable=import-error
@@ -114,12 +114,13 @@ def _send_upstream(
             retrying messages after stop_event is set, defaults to 30.
     """
     request_tries = {}
+    print >> sys.stderr, "Stop event status: ", stop_event.is_set()
 
     while not stop_event.is_set():
         try:
             client.reinit()
         except Exception as e:
-            log.warn('Async producer failed to connect to brokers; backoff for %s(ms) before retrying', retry_options.backoff_ms)
+            log.warning('Async producer failed to connect to brokers; backoff for %s(ms) before retrying', retry_options.backoff_ms)
             time.sleep(float(retry_options.backoff_ms) / 1000)
         else:
             break
@@ -149,10 +150,13 @@ def _send_upstream(
         queue_iterator(queue), *map(transform_pending_msg, pending_messages))
 
     start = dtime.now()
-    queue_timeout = timedelta(seconds=1)
+    # queue_timeout = timedelta(seconds=30)
     failed_msgs = []
-    while not (stop_event.is_set() and not request_tries) and \
-            dtime.now() - start < queue_timeout:
+    while not (stop_event.is_set() and not request_tries):  #  and \
+            # dtime.now() - start < queue_timeout:
+        print('stop-event: {}'.format(stop_event.is_set()))
+        print('request_tries: {}'.format(request_tries))
+        # print("{} remaining".format(queue_timeout - (dtime.now() - start)))
         # Handle stop_timeout
         if stop_event.is_set():
             if not stop_at:
@@ -202,8 +206,6 @@ def _send_upstream(
         # Send collected requests upstream
         for topic_partition, msg in msgset.items():
             messages = create_message_set(msg, codec, key, codec_compresslevel)
-            print("Send collected requests upstream")
-            print(msg, codec, key, codec_compresslevel)
             req = ProduceRequestPayload(
                 topic_partition.topic,
                 topic_partition.partition,
@@ -213,6 +215,10 @@ def _send_upstream(
                 'key': key,
                 'msg': msg,
             }
+        print("Created payloads:")
+        for req, data in request_tries.items():
+            print('request: {}'.format(req))
+            print('msg: {}, codec: {}, key: {}'.format(msg, codec, key))
 
         if not request_tries:
             continue
@@ -240,6 +246,10 @@ def _send_upstream(
                                                 timeout=ack_timeout,
                                                 fail_on_error=False)
         print("CALLS: {}".format(client.send_produce_request.call_count))
+        if isinstance(responses[0], (RETRY_ERROR_TYPES, RETRY_BACKOFF_ERROR_TYPES)):
+            print("ERROR")
+        else:
+            print("SUCCESS")
 
         log.debug('Received: %s', responses)
         for i, response in enumerate(responses):
@@ -309,6 +319,32 @@ def _send_upstream(
                      orig_req.topic, orig_req.partition,
                      orig_req.messages if log_messages_on_error
                                        else hash(orig_req.messages))
+
+    # store messages that were put on retry but didn't have a chance to be
+    # reprocessed
+    print("request tries: {}".format(len(request_tries.keys())))
+    for req, req_value in request_tries.items():
+        key = req_value['key']
+        msg = req_value['msg']
+        failed_msgs.append({
+            'key': key,
+            'topic': req.topic,
+            'partition': req.partition,
+            'msgs': [m[0] for m in msg],
+        })
+
+    # store messages that hasn't been processed at all
+    while True:
+        try:
+            topic_partition, msg, key = next(all_messages)
+            failed_msgs.append({
+                'key': key,
+                'topic': topic_partition.topic,
+                'partition': topic_partition.partition,
+                'msgs': [m[0] for m in msg],
+            })
+        except StopIteration:
+            break
 
     _store_unsent_messages(failed_msgs)
 
@@ -547,8 +583,9 @@ class Producer(object):
                 args = {
                     '_topic': pending_msg_data['topic'],
                     '_partition': pending_msg_data['partition'],
-                    'key': pending_msg_data.get('key'),
-                    '_msg': pending_msg_data['msgs'],
+                    'key': pending_msg_data.get('key') and
+                           pending_msg_data.get('key').encode('ascii'),
+                    '_msg': [m.encode('ascii') for m in pending_msg_data['msgs']],
                 }
                 do_actual_send(**args)
             except KafkaError:
