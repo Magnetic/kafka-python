@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 
+import os
 import collections
 import logging
 import threading
 import time
+from datetime import datetime as dtime
 
 from mock import MagicMock, patch
-from . import unittest
+from test import unittest
+from test.testutil import DisableUnsentStoringMixin
 
 from kafka import SimpleClient, SimpleProducer, KeyedProducer
 from kafka.errors import (
     AsyncProducerQueueFull, FailedPayloadsError, NotLeaderForPartitionError)
-from kafka.producer.base import Producer, _send_upstream
+from kafka.producer.base import (
+    Producer, _send_upstream, KAFKA_UNSENT_FILE, _get_pending_messages)
 from kafka.protocol import CODEC_NONE
 from kafka.structs import (
     ProduceResponsePayload, RetryOptions, TopicPartition)
@@ -19,7 +23,43 @@ from kafka.structs import (
 from six.moves import queue, xrange
 
 
-class TestKafkaProducer(unittest.TestCase):
+class ProccessRunnerMixin(object):
+    def setUp(self):
+        super(ProccessRunnerMixin, self).setUp()
+        self.client = MagicMock()
+        self.queue = queue.Queue()
+
+    def tearDown(self):
+        super(ProccessRunnerMixin, self).tearDown()
+        # self.thread.join()
+        for _ in xrange(self.queue.qsize()):
+            self.queue.get()
+
+    def _run_process(
+            self, retries_limit=3, sleep_timeout=1, backoff_ms=50,
+            batch_length=3):
+        # run _send_upstream process with the queue
+        start = dtime.now()
+        stop_event = threading.Event()
+        retry_options = RetryOptions(limit=retries_limit,
+                                     backoff_ms=backoff_ms,
+                                     retry_on_timeouts=False)
+        self.thread = threading.Thread(
+            target=_send_upstream,
+            args=(self.queue, self.client, CODEC_NONE,
+                  0.3,  # batch time (seconds)
+                  batch_length,  # batch length
+                  Producer.ACK_AFTER_LOCAL_WRITE,
+                  Producer.DEFAULT_ACK_TIMEOUT,
+                  retry_options,
+                  stop_event))
+        self.thread.daemon = True
+        self.thread.start()
+        time.sleep(sleep_timeout)
+        stop_event.set()
+
+
+class TestKafkaProducer(DisableUnsentStoringMixin, unittest.TestCase):
     def test_producer_message_types(self):
 
         producer = Producer(MagicMock())
@@ -89,21 +129,21 @@ class TestKafkaProducer(unittest.TestCase):
 
     def test_producer_sync_fail_on_error(self):
         error = FailedPayloadsError('failure')
-        with patch.object(SimpleClient, 'load_metadata_for_topics'):
-            with patch.object(SimpleClient, 'ensure_topic_exists'):
-                with patch.object(SimpleClient, 'get_partition_ids_for_topic', return_value=[0, 1]):
-                    with patch.object(SimpleClient, '_send_broker_aware_request', return_value = [error]):
+        with patch.object(SimpleClient, 'load_metadata_for_topics'), \
+            patch.object(SimpleClient, 'ensure_topic_exists'), \
+            patch.object(SimpleClient, 'get_partition_ids_for_topic', return_value=[0, 1]), \
+            patch.object(SimpleClient, '_send_broker_aware_request', return_value=[error]):
 
-                        client = SimpleClient(MagicMock())
-                        producer = SimpleProducer(client, async_send=False, sync_fail_on_error=False)
+            client = SimpleClient(MagicMock())
+            producer = SimpleProducer(client, async_send=False, sync_fail_on_error=False)
 
-                        # This should not raise
-                        (response,) = producer.send_messages('foobar', b'test message')
-                        self.assertEqual(response, error)
+            # This should not raise
+            (response,) = producer.send_messages('foobar', b'test message')
+            self.assertEqual(response, error)
 
-                        producer = SimpleProducer(client, async_send=False, sync_fail_on_error=True)
-                        with self.assertRaises(FailedPayloadsError):
-                            producer.send_messages('foobar', b'test message')
+            producer = SimpleProducer(client, async_send=False, sync_fail_on_error=True)
+            with self.assertRaises(FailedPayloadsError):
+                producer.send_messages(b'foobar', b'test message')
 
     def test_cleanup_is_not_called_on_stopped_producer(self):
         producer = Producer(MagicMock(), async_send=True)
@@ -112,39 +152,24 @@ class TestKafkaProducer(unittest.TestCase):
             producer._cleanup_func(producer)
             self.assertEqual(mocked_stop.call_count, 0)
 
+        # I dunno how tests passed previously, but the issue is that the thread is not stopped
+        # (we mocked the stop function when `__init__` exits and original `stop` is never called)
+        # so we have to stop manually, otherwise it just fucks up other tests
+        # it kinda takes longer to finish tests but... what the hell ?
+        producer.stopped = False
+        producer.stop()
+
     def test_cleanup_is_called_on_running_producer(self):
         producer = Producer(MagicMock(), async_send=True)
         producer.stopped = False
         with patch.object(producer, 'stop') as mocked_stop:
             producer._cleanup_func(producer)
             self.assertEqual(mocked_stop.call_count, 1)
+        producer.stop()
 
 
-class TestKafkaProducerSendUpstream(unittest.TestCase):
-
-    def setUp(self):
-        self.client = MagicMock()
-        self.queue = queue.Queue()
-
-    def _run_process(self, retries_limit=3, sleep_timeout=1):
-        # run _send_upstream process with the queue
-        stop_event = threading.Event()
-        retry_options = RetryOptions(limit=retries_limit,
-                                     backoff_ms=50,
-                                     retry_on_timeouts=False)
-        self.thread = threading.Thread(
-            target=_send_upstream,
-            args=(self.queue, self.client, CODEC_NONE,
-                  0.3, # batch time (seconds)
-                  3, # batch length
-                  Producer.ACK_AFTER_LOCAL_WRITE,
-                  Producer.DEFAULT_ACK_TIMEOUT,
-                  retry_options,
-                  stop_event))
-        self.thread.daemon = True
-        self.thread.start()
-        time.sleep(sleep_timeout)
-        stop_event.set()
+class TestKafkaProducerSendUpstream(
+    DisableUnsentStoringMixin, ProccessRunnerMixin, unittest.TestCase):
 
     def test_wo_retries(self):
 
@@ -171,6 +196,7 @@ class TestKafkaProducerSendUpstream(unittest.TestCase):
         # Mock offsets counter for closure
         offsets = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
         self.client.is_first_time = True
+
         def send_side_effect(reqs, *args, **kwargs):
             if self.client.is_first_time:
                 self.client.is_first_time = False
@@ -196,7 +222,6 @@ class TestKafkaProducerSendUpstream(unittest.TestCase):
         self.assertEqual(self.client.send_produce_request.call_count, 5)
 
     def test_with_limited_retries(self):
-
         # lets create a queue and add 10 messages for 10 different partitions
         # to show how retries should work ideally
         for i in range(10):
@@ -225,6 +250,7 @@ class TestKafkaProducerSendUpstream(unittest.TestCase):
         # Mock offsets counter for closure
         offsets = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
         self.client.is_first_time = True
+
         def send_side_effect(reqs, *args, **kwargs):
             if self.client.is_first_time:
                 self.client.is_first_time = False
@@ -252,6 +278,87 @@ class TestKafkaProducerSendUpstream(unittest.TestCase):
         # + 3 batches of 3 msgs each + 1 batch of 1 msg = 1 + 3 + 1 = 5
         self.assertEqual(self.client.send_produce_request.call_count, 5)
 
+
+class TestUnsentKafkaMessages(ProccessRunnerMixin, unittest.TestCase):
     def tearDown(self):
-        for _ in xrange(self.queue.qsize()):
-            self.queue.get()
+        try:
+            os.remove(KAFKA_UNSENT_FILE)
+        except OSError as e:
+            if e.errno != 2:
+                raise
+
+    def test_unsent_message_saved_properly(self):
+        # single message
+        self.queue.put((TopicPartition("test", 0), "msg %i" % 0, "key %i" % 0))
+
+        def send_side_effect(reqs, *args, **kwargs):
+            return [FailedPayloadsError(req) for req in reqs]
+
+        self.client.send_produce_request.side_effect = send_side_effect
+
+        # 4 retries * 900ms. 4 should pass (3 is 2700 and 4ths starts before timeout)
+        self._run_process(5, 3, backoff_ms=900)
+        self.thread.join()
+
+        # the queue should be void at the end of the test
+        self.assertEqual(self.queue.empty(), True)
+
+        pending_msgs = _get_pending_messages()
+        self.assertEqual(1, len(pending_msgs))
+        self.assertEqual({
+            'key': "key 0",
+            'topic': "test",
+            'partition': 0,
+            'msgs': ["msg 0"],
+        }, pending_msgs[0])
+
+    def test_unsent_multiple_messages_saved_properly(self):
+        # 14 messages
+        for i in range(14):
+            self.queue.put((TopicPartition("test", i), "msg %i" % i, "key %i" % i))
+
+        self.client.return_good = False
+
+        def send_side_effect(reqs, *args, **kwargs):
+            """
+            return "good" response every second time
+            """
+            if self.client.return_good and reqs[0].partition < 12:
+                responses = []
+                for req in reqs:
+                    responses.append(
+                        ProduceResponsePayload(req.topic, req.partition, 0, 0)
+                    )
+                retval = responses
+            else:
+                retval = [FailedPayloadsError(req) for req in reqs]
+
+            self.client.return_good = not self.client.return_good
+
+            return retval
+
+        self.client.send_produce_request.side_effect = send_side_effect
+
+        # 14 messages, 1 retry
+        # 0-2 msgs batch fail - adding 900ms, calls: 1
+        # 0-2 msgs succeed, calls: 2
+        # 3-5 msgs fail - adding 900ms, total 1800ms, calls: 3
+        # 3-5 msgs succeed, calls: 4
+        # 6-8 fail - adding 900ms, total 2700ms, calls: 5
+        # 6-8 succeed, calls: 6
+        # 9-11 fail, total 3600ms, calls: 7
+        # 9-11 succeed, calls: 8
+        # 12-13 - fail, 4500ms, calls: 9
+        # 12-13 - fail again, calls: 10
+        # timed out
+
+        backoff_ms = 900
+        self._run_process(1, 4, backoff_ms=backoff_ms)
+        self.thread.join()
+
+        # the queue should be void at the end of the test
+        self.assertEqual(self.queue.empty(), True)
+
+        pending_msgs = _get_pending_messages()
+        self.assertEqual(2, len(pending_msgs))
+

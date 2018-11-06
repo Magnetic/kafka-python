@@ -1,8 +1,11 @@
 from __future__ import absolute_import
 
+import functools
+import itertools
 import atexit
 import logging
 import time
+import json
 
 try:
     from queue import Empty, Full, Queue  # pylint: disable=import-error
@@ -10,12 +13,12 @@ except ImportError:
     from Queue import Empty, Full, Queue  # pylint: disable=import-error
 from collections import defaultdict
 
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 
 from kafka.vendor import six
 
 from kafka.errors import (
-    kafka_errors, UnsupportedCodecError, FailedPayloadsError,
+    kafka_errors, KafkaError, UnsupportedCodecError, FailedPayloadsError,
     RequestTimedOutError, AsyncProducerQueueFull, UnknownError,
     RETRY_ERROR_TYPES, RETRY_BACKOFF_ERROR_TYPES, RETRY_REFRESH_ERROR_TYPES)
 from kafka.protocol import CODEC_NONE, ALL_CODECS, create_message_set
@@ -41,12 +44,43 @@ ASYNC_STOP_TIMEOUT_SECS = 30
 
 SYNC_FAIL_ON_ERROR_DEFAULT = True
 
+KAFKA_UNSENT_FILE = './kafka_unsent.json'
+FAILED_MSGS_MAXSIZE = 128
 
-def _send_upstream(queue, client, codec, batch_time, batch_size,
-                   req_acks, ack_timeout, retry_options, stop_event,
-                   log_messages_on_error=ASYNC_LOG_MESSAGES_ON_ERROR,
-                   stop_timeout=ASYNC_STOP_TIMEOUT_SECS,
-                   codec_compresslevel=None):
+
+def synchronized(wrapped):
+    lock = Lock()
+
+    @functools.wraps(wrapped)
+    def _wrapper(*args, **kwargs):
+        with lock:
+            return wrapped(*args, **kwargs)
+
+    return _wrapper
+
+
+def _get_pending_messages():
+    try:
+        with open(KAFKA_UNSENT_FILE) as f:
+            return json.load(f)
+    except (IOError, ValueError):
+        return []
+
+
+def _store_unsent_messages(failed_msgs):
+    with open(KAFKA_UNSENT_FILE, 'w') as f:
+        json.dump(failed_msgs[:FAILED_MSGS_MAXSIZE], f)
+
+
+@synchronized  # we are writing unsent msgs to a file so we cannot afford to run
+# this in parallel
+def _send_upstream(
+        queue, client, codec, batch_time, batch_size,
+        req_acks, ack_timeout, retry_options, stop_event,
+        log_messages_on_error=ASYNC_LOG_MESSAGES_ON_ERROR,
+        stop_timeout=ASYNC_STOP_TIMEOUT_SECS,
+        codec_compresslevel=None):
+
     """Private method to manage producing messages asynchronously
 
     Listens on the queue for a specified number of messages or until
@@ -83,14 +117,36 @@ def _send_upstream(queue, client, codec, batch_time, batch_size,
         try:
             client.reinit()
         except Exception as e:
-            log.warn('Async producer failed to connect to brokers; backoff for %s(ms) before retrying', retry_options.backoff_ms)
+            log.warning('Async producer failed to connect to brokers; backoff for %s(ms) before retrying', retry_options.backoff_ms)
             time.sleep(float(retry_options.backoff_ms) / 1000)
         else:
             break
 
-    stop_at = None
-    while not (stop_event.is_set() and queue.empty() and not request_tries):
+    pending_messages = _get_pending_messages()
 
+    stop_at = None
+
+    def transform_pending_msg(m):
+        for msg in m['msgs']:
+            yield TopicPartition(m['topic'], m['partition']), \
+                msg, m['key']
+
+    def queue_iterator(q):
+        """
+        Returns:
+            topic_partition, msg, key
+        """
+        try:
+            while True:
+                yield q.get(timeout=batch_time)
+        except Empty:
+            pass
+
+    all_messages = itertools.chain(
+        queue_iterator(queue), *map(transform_pending_msg, pending_messages))
+
+    failed_msgs = []
+    while not (stop_event.is_set() and not request_tries):
         # Handle stop_timeout
         if stop_event.is_set():
             if not stop_at:
@@ -116,8 +172,8 @@ def _send_upstream(queue, client, codec, batch_time, batch_size,
         # timeout is reached
         while count > 0 and timeout >= 0:
             try:
-                topic_partition, msg, key = queue.get(timeout=timeout)
-            except Empty:
+                topic_partition, msg, key = next(all_messages)
+            except StopIteration:
                 break
 
             # Check if the controller has requested us to stop
@@ -137,7 +193,11 @@ def _send_upstream(queue, client, codec, batch_time, batch_size,
                 topic_partition.topic,
                 topic_partition.partition,
                 tuple(messages))
-            request_tries[req] = 0
+            request_tries[req] = {
+                'count': 0,
+                'key': key,
+                'msg': msg,
+            }
 
         if not request_tries:
             continue
@@ -149,7 +209,8 @@ def _send_upstream(queue, client, codec, batch_time, batch_size,
         }
 
         def _handle_error(error_cls, request):
-            if issubclass(error_cls, RETRY_ERROR_TYPES) or (retry_options.retry_on_timeouts and issubclass(error_cls, RequestTimedOutError)):
+            if issubclass(error_cls, RETRY_ERROR_TYPES) or \
+                    (retry_options.retry_on_timeouts and issubclass(error_cls, RequestTimedOutError)):
                 reqs_to_retry.append(request)
             if issubclass(error_cls, RETRY_BACKOFF_ERROR_TYPES):
                 retry_state['do_backoff'] |= True
@@ -189,25 +250,38 @@ def _send_upstream(queue, client, codec, batch_time, batch_size,
 
         # doing backoff before next retry
         if retry_state['do_backoff'] and retry_options.backoff_ms:
-            log.warn('Async producer backoff for %s(ms) before retrying', retry_options.backoff_ms)
+            log.warning('Async producer backoff for %s(ms) before retrying', retry_options.backoff_ms)
             time.sleep(float(retry_options.backoff_ms) / 1000)
 
         # refresh topic metadata before next retry
         if retry_state['do_refresh']:
-            log.warn('Async producer forcing metadata refresh metadata before retrying')
+            log.warning('Async producer forcing metadata refresh metadata before retrying')
             try:
                 client.load_metadata_for_topics()
             except Exception:
                 log.exception("Async producer couldn't reload topic metadata.")
 
         # Apply retry limit, dropping messages that are over
-        request_tries = dict(
-            (key, count + 1)
-            for (key, count) in request_tries.items()
-                if key in reqs_to_retry
-                    and (retry_options.limit is None
-                    or (count < retry_options.limit))
-        )
+        request_tries_filtered = {}
+        for req, req_value in request_tries.items():
+            count = req_value['count']
+            key = req_value['key']
+            msg = req_value['msg']
+            if req in reqs_to_retry \
+                    and (retry_options.limit is None or
+                         (count < retry_options.limit)):
+                request_tries_filtered.setdefault(req, {})['count'] = count + 1
+                request_tries_filtered[req]['key'] = key
+                request_tries_filtered[req]['msg'] = msg
+            else:
+                failed_msgs.append({
+                    'key': key,
+                    'topic': req.topic,
+                    'partition': req.partition,
+                    'msgs': [m[0] for m in msg],
+                })
+
+        request_tries = request_tries_filtered
 
         # Log messages we are going to retry
         for orig_req in request_tries.keys():
@@ -215,6 +289,33 @@ def _send_upstream(queue, client, codec, batch_time, batch_size,
                      orig_req.topic, orig_req.partition,
                      orig_req.messages if log_messages_on_error
                                        else hash(orig_req.messages))
+
+    # store messages that were put on retry but didn't have a chance to be
+    # reprocessed
+    for req, req_value in request_tries.items():
+        key = req_value['key']
+        msg = req_value['msg']
+        failed_msgs.append({
+            'key': key,
+            'topic': req.topic,
+            'partition': req.partition,
+            'msgs': [m[0] for m in msg],
+        })
+
+    # store messages that hasn't been processed at all
+    while True:
+        try:
+            topic_partition, msg, key = next(all_messages)
+            failed_msgs.append({
+                'key': key,
+                'topic': topic_partition.topic,
+                'partition': topic_partition.partition,
+                'msgs': [m[0] for m in msg],
+            })
+        except StopIteration:
+            break
+
+    _store_unsent_messages(failed_msgs)
 
     if request_tries or not queue.empty():
         log.error('Stopped producer with %d unsent messages', len(request_tries) + queue.qsize())
@@ -387,52 +488,93 @@ class Producer(object):
         return self._send_messages(topic, partition, *msg)
 
     def _send_messages(self, topic, partition, *msg, **kwargs):
-        key = kwargs.pop('key', None)
+        def do_actual_send(_topic, _partition, *_msg, **_kwargs):
+            key = _kwargs.pop('key', None)
 
-        # Guarantee that msg is actually a list or tuple (should always be true)
-        if not isinstance(msg, (list, tuple)):
-            raise TypeError("msg is not a list or tuple!")
+            # Guarantee that msg is actually a list or tuple (should always be true)
+            if not isinstance(_msg, (list, tuple)):
+                raise TypeError("msg is not a list or tuple!")
 
-        for m in msg:
-            # The protocol allows to have key & payload with null values both,
-            # (https://goo.gl/o694yN) but having (null,null) pair doesn't make sense.
-            if m is None:
-                if key is None:
-                    raise TypeError("key and payload can't be null in one")
-            # Raise TypeError if any non-null message is not encoded as bytes
-            elif not isinstance(m, six.binary_type):
-                raise TypeError("all produce message payloads must be null or type bytes")
+            for m in _msg:
+                # The protocol allows to have key & payload with null values both,
+                # (https://goo.gl/o694yN) but having (null,null) pair doesn't make sense.
+                if m is None:
+                    if key is None:
+                        raise TypeError("key and payload can't be null in one")
+                # Raise TypeError if any non-null message is not encoded as bytes
+                elif not isinstance(m, six.binary_type):
+                    raise TypeError("all produce message payloads must be null or type bytes")
 
-        # Raise TypeError if the key is not encoded as bytes
-        if key is not None and not isinstance(key, six.binary_type):
-            raise TypeError("the key must be type bytes")
+            # Raise TypeError if the key is not encoded as bytes
+            if key is not None and not isinstance(key, six.binary_type):
+                raise TypeError("the key must be type bytes")
 
-        if self.async_send:
-            for idx, m in enumerate(msg):
+            if self.async_send:
+                for idx, m in enumerate(_msg):
+                    try:
+                        item = (TopicPartition(_topic, _partition), m, key)
+                        if self.async_queue_put_timeout == 0:
+                            self.queue.put_nowait(item)
+                        else:
+                            self.queue.put(item, True, self.async_queue_put_timeout)
+                    except Full:
+                        raise AsyncProducerQueueFull(
+                            _msg[idx:],
+                            'Producer async queue overfilled. '
+                            'Current queue size %d.' % self.queue.qsize())
+                resp = []
+            else:
+                messages = create_message_set([(m, key) for m in _msg], self.codec, key, self.codec_compresslevel)
+                req = ProduceRequestPayload(_topic, _partition, messages)
                 try:
-                    item = (TopicPartition(topic, partition), m, key)
-                    if self.async_queue_put_timeout == 0:
-                        self.queue.put_nowait(item)
-                    else:
-                        self.queue.put(item, True, self.async_queue_put_timeout)
-                except Full:
-                    raise AsyncProducerQueueFull(
-                        msg[idx:],
-                        'Producer async queue overfilled. '
-                        'Current queue size %d.' % self.queue.qsize())
-            resp = []
-        else:
-            messages = create_message_set([(m, key) for m in msg], self.codec, key, self.codec_compresslevel)
-            req = ProduceRequestPayload(topic, partition, messages)
+                    resp = self.client.send_produce_request(
+                        [req], acks=self.req_acks, timeout=self.ack_timeout,
+                        fail_on_error=self.sync_fail_on_error
+                    )
+                except Exception:
+                    log.exception("Unable to send messages")
+                    raise
+            return resp
+
+        # I'm not sure if this is the best place to put
+        failed_msgs = []
+        for pending_msg_data in _get_pending_messages():
             try:
-                resp = self.client.send_produce_request(
-                    [req], acks=self.req_acks, timeout=self.ack_timeout,
-                    fail_on_error=self.sync_fail_on_error
-                )
-            except Exception:
-                log.exception("Unable to send messages")
-                raise
-        return resp
+                args = {
+                    '_topic': pending_msg_data['topic'],
+                    '_partition': pending_msg_data['partition'],
+                    'key': pending_msg_data.get('key') and
+                           pending_msg_data.get('key').encode('ascii'),
+                    '_msg': [m.encode('ascii') for m in pending_msg_data['msgs']],
+                }
+                do_actual_send(**args)
+            except KafkaError:
+                failed_msgs.append(pending_msg_data)
+
+        try:
+            return do_actual_send(topic, partition, *msg, **kwargs)
+        except KafkaError:
+            failed_msgs.append({
+                'topic': topic,
+                'partition': partition,
+                'msgs': msg,  # an array of binary strings
+                'key': kwargs.get('key'),
+            })
+            raise
+        finally:
+            if len(failed_msgs) > FAILED_MSGS_MAXSIZE:
+                # how do we notify Sentry about this ?
+                pass
+
+            # convert binary to str so it's probably handled by json
+            failed_msgs = [{
+                'topic': msg['topic'].decode('ascii'),
+                'partition': msg['partition'],
+                'msgs': [m.decode('ascii') for m in msg['msgs']],
+                'key': kwargs.get('key'),
+            } for msg in failed_msgs]
+
+            _store_unsent_messages(failed_msgs)
 
     def stop(self, timeout=None):
         """
@@ -450,10 +592,9 @@ class Producer(object):
             log.warning('producer.stop() called, but producer is already stopped')
             return
 
-        if self.async_send:
-            self.queue.put((STOP_ASYNC_PRODUCER, None, None))
-            self.thread_stop_event.set()
-            self.thread.join()
+        self.queue.put((STOP_ASYNC_PRODUCER, None, None))
+        self.thread_stop_event.set()
+        self.thread.join()
 
         if hasattr(self, '_cleanup_func'):
             # Remove cleanup handler now that we've stopped
@@ -480,3 +621,4 @@ class Producer(object):
     def __del__(self):
         if self.async_send and not self.stopped:
             self.stop()
+
