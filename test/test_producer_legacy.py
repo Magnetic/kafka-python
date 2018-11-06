@@ -5,7 +5,6 @@ import collections
 import logging
 import threading
 import time
-import shutil
 from datetime import datetime as dtime
 
 from mock import MagicMock, patch
@@ -46,14 +45,6 @@ class ProccessRunnerMixin(object):
         retry_options = RetryOptions(limit=retries_limit,
                                      backoff_ms=backoff_ms,
                                      retry_on_timeouts=False)
-        # _send_upstream(
-        #     self.queue, self.client, CODEC_NONE,
-        #     0.3, # batch time (seconds)
-        #     batch_length, # batch length
-        #     Producer.ACK_AFTER_LOCAL_WRITE,
-        #     Producer.DEFAULT_ACK_TIMEOUT,
-        #     retry_options,
-        #     stop_event)
         self.thread = threading.Thread(
             target=_send_upstream,
             args=(self.queue, self.client, CODEC_NONE,
@@ -73,90 +64,90 @@ class ProccessRunnerMixin(object):
 
 
 class TestKafkaProducer(DisableUnsentStoringMixin, unittest.TestCase):
-    # def test_producer_message_types(self):
-    #
-    #     producer = Producer(MagicMock())
-    #     topic = b"test-topic"
-    #     partition = 0
-    #
-    #     bad_data_types = (u'你怎么样?', 12, ['a', 'list'],
-    #                       ('a', 'tuple'), {'a': 'dict'}, None,)
-    #     for m in bad_data_types:
-    #         with self.assertRaises(TypeError):
-    #             logging.debug("attempting to send message of type %s", type(m))
-    #             producer.send_messages(topic, partition, m)
-    #
-    #     good_data_types = (b'a string!',)
-    #     for m in good_data_types:
-    #         # This should not raise an exception
-    #         producer.send_messages(topic, partition, m)
-    #
-    # def test_keyedproducer_message_types(self):
-    #     client = MagicMock()
-    #     client.get_partition_ids_for_topic.return_value = [0, 1]
-    #     producer = KeyedProducer(client)
-    #     topic = b"test-topic"
-    #     key = b"testkey"
-    #
-    #     bad_data_types = (u'你怎么样?', 12, ['a', 'list'],
-    #                       ('a', 'tuple'), {'a': 'dict'},)
-    #     for m in bad_data_types:
-    #         with self.assertRaises(TypeError):
-    #             logging.debug("attempting to send message of type %s", type(m))
-    #             producer.send_messages(topic, key, m)
-    #
-    #     good_data_types = (b'a string!', None,)
-    #     for m in good_data_types:
-    #         # This should not raise an exception
-    #         producer.send_messages(topic, key, m)
-    #
-    # def test_topic_message_types(self):
-    #     client = MagicMock()
-    #
-    #     def partitions(topic):
-    #         return [0, 1]
-    #
-    #     client.get_partition_ids_for_topic = partitions
-    #
-    #     producer = SimpleProducer(client, random_start=False)
-    #     topic = b"test-topic"
-    #     producer.send_messages(topic, b'hi')
-    #     assert client.send_produce_request.called
-    #
-    # @patch('kafka.producer.base._send_upstream')
-    # def test_producer_async_queue_overfilled(self, mock):
-    #     queue_size = 2
-    #     producer = Producer(MagicMock(), async_send=True,
-    #                         async_queue_maxsize=queue_size)
-    #
-    #     topic = b'test-topic'
-    #     partition = 0
-    #     message = b'test-message'
-    #
-    #     with self.assertRaises(AsyncProducerQueueFull):
-    #         message_list = [message] * (queue_size + 1)
-    #         producer.send_messages(topic, partition, *message_list)
-    #     self.assertEqual(producer.queue.qsize(), queue_size)
-    #     for _ in xrange(producer.queue.qsize()):
-    #         producer.queue.get()
-    #
-    # def test_producer_sync_fail_on_error(self):
-    #     error = FailedPayloadsError('failure')
-    #     with patch.object(SimpleClient, 'load_metadata_for_topics'), \
-    #         patch.object(SimpleClient, 'ensure_topic_exists'), \
-    #         patch.object(SimpleClient, 'get_partition_ids_for_topic', return_value=[0, 1]), \
-    #         patch.object(SimpleClient, '_send_broker_aware_request', return_value=[error]):
-    #
-    #         client = SimpleClient(MagicMock())
-    #         producer = SimpleProducer(client, async_send=False, sync_fail_on_error=False)
-    #
-    #         # This should not raise
-    #         (response,) = producer.send_messages('foobar', b'test message')
-    #         self.assertEqual(response, error)
-    #
-    #         producer = SimpleProducer(client, async_send=False, sync_fail_on_error=True)
-    #         with self.assertRaises(FailedPayloadsError):
-    #             producer.send_messages(b'foobar', b'test message')
+    def test_producer_message_types(self):
+
+        producer = Producer(MagicMock())
+        topic = b"test-topic"
+        partition = 0
+
+        bad_data_types = (u'你怎么样?', 12, ['a', 'list'],
+                          ('a', 'tuple'), {'a': 'dict'}, None,)
+        for m in bad_data_types:
+            with self.assertRaises(TypeError):
+                logging.debug("attempting to send message of type %s", type(m))
+                producer.send_messages(topic, partition, m)
+
+        good_data_types = (b'a string!',)
+        for m in good_data_types:
+            # This should not raise an exception
+            producer.send_messages(topic, partition, m)
+
+    def test_keyedproducer_message_types(self):
+        client = MagicMock()
+        client.get_partition_ids_for_topic.return_value = [0, 1]
+        producer = KeyedProducer(client)
+        topic = b"test-topic"
+        key = b"testkey"
+
+        bad_data_types = (u'你怎么样?', 12, ['a', 'list'],
+                          ('a', 'tuple'), {'a': 'dict'},)
+        for m in bad_data_types:
+            with self.assertRaises(TypeError):
+                logging.debug("attempting to send message of type %s", type(m))
+                producer.send_messages(topic, key, m)
+
+        good_data_types = (b'a string!', None,)
+        for m in good_data_types:
+            # This should not raise an exception
+            producer.send_messages(topic, key, m)
+
+    def test_topic_message_types(self):
+        client = MagicMock()
+
+        def partitions(topic):
+            return [0, 1]
+
+        client.get_partition_ids_for_topic = partitions
+
+        producer = SimpleProducer(client, random_start=False)
+        topic = b"test-topic"
+        producer.send_messages(topic, b'hi')
+        assert client.send_produce_request.called
+
+    @patch('kafka.producer.base._send_upstream')
+    def test_producer_async_queue_overfilled(self, mock):
+        queue_size = 2
+        producer = Producer(MagicMock(), async_send=True,
+                            async_queue_maxsize=queue_size)
+
+        topic = b'test-topic'
+        partition = 0
+        message = b'test-message'
+
+        with self.assertRaises(AsyncProducerQueueFull):
+            message_list = [message] * (queue_size + 1)
+            producer.send_messages(topic, partition, *message_list)
+        self.assertEqual(producer.queue.qsize(), queue_size)
+        for _ in xrange(producer.queue.qsize()):
+            producer.queue.get()
+
+    def test_producer_sync_fail_on_error(self):
+        error = FailedPayloadsError('failure')
+        with patch.object(SimpleClient, 'load_metadata_for_topics'), \
+            patch.object(SimpleClient, 'ensure_topic_exists'), \
+            patch.object(SimpleClient, 'get_partition_ids_for_topic', return_value=[0, 1]), \
+            patch.object(SimpleClient, '_send_broker_aware_request', return_value=[error]):
+
+            client = SimpleClient(MagicMock())
+            producer = SimpleProducer(client, async_send=False, sync_fail_on_error=False)
+
+            # This should not raise
+            (response,) = producer.send_messages('foobar', b'test message')
+            self.assertEqual(response, error)
+
+            producer = SimpleProducer(client, async_send=False, sync_fail_on_error=True)
+            with self.assertRaises(FailedPayloadsError):
+                producer.send_messages(b'foobar', b'test message')
 
     def test_cleanup_is_not_called_on_stopped_producer(self):
         producer = Producer(MagicMock(), async_send=True)
@@ -327,7 +318,7 @@ class TestUnsentKafkaMessages(ProccessRunnerMixin, unittest.TestCase):
         }, pending_msgs[0])
 
     def test_unsent_multiple_messages_saved_properly(self):
-        # 7 messages
+        # 14 messages
         for i in range(14):
             self.queue.put((TopicPartition("test", i), "msg %i" % i, "key %i" % i))
 
@@ -353,7 +344,7 @@ class TestUnsentKafkaMessages(ProccessRunnerMixin, unittest.TestCase):
 
         self.client.send_produce_request.side_effect = send_side_effect
 
-        # 7 messages, 1 retry
+        # 14 messages, 1 retry
         # 0-2 msgs batch fail - adding 900ms, calls: 1
         # 0-2 msgs succeed, calls: 2
         # 3-5 msgs fail - adding 900ms, total 1800ms, calls: 3

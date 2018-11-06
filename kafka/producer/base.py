@@ -6,8 +6,6 @@ import atexit
 import logging
 import time
 import json
-from datetime import datetime as dtime, timedelta
-import sys
 
 try:
     from queue import Empty, Full, Queue  # pylint: disable=import-error
@@ -28,7 +26,6 @@ from kafka.structs import (
     ProduceRequestPayload, ProduceResponsePayload, TopicPartition, RetryOptions)
 
 log = logging.getLogger('kafka.producer')
-log.setLevel(logging.DEBUG)
 
 BATCH_SEND_DEFAULT_INTERVAL = 20
 BATCH_SEND_MSG_COUNT = 20
@@ -114,7 +111,6 @@ def _send_upstream(
             retrying messages after stop_event is set, defaults to 30.
     """
     request_tries = {}
-    print >> sys.stderr, "Stop event status: ", stop_event.is_set()
 
     while not stop_event.is_set():
         try:
@@ -141,7 +137,6 @@ def _send_upstream(
         """
         try:
             while True:
-                # print("queue size: {}".format(q.qsize()))
                 yield q.get(timeout=batch_time)
         except Empty:
             pass
@@ -149,14 +144,8 @@ def _send_upstream(
     all_messages = itertools.chain(
         queue_iterator(queue), *map(transform_pending_msg, pending_messages))
 
-    start = dtime.now()
-    # queue_timeout = timedelta(seconds=30)
     failed_msgs = []
-    while not (stop_event.is_set() and not request_tries):  #  and \
-            # dtime.now() - start < queue_timeout:
-        print('stop-event: {}'.format(stop_event.is_set()))
-        print('request_tries: {}'.format(request_tries))
-        # print("{} remaining".format(queue_timeout - (dtime.now() - start)))
+    while not (stop_event.is_set() and not request_tries):
         # Handle stop_timeout
         if stop_event.is_set():
             if not stop_at:
@@ -182,14 +171,7 @@ def _send_upstream(
         # timeout is reached
         while count > 0 and timeout >= 0:
             try:
-                val = next(all_messages)
-                try:
-                    topic_partition, msg, key = val
-                    print("Extracted row, {}, {}, {}".format(topic_partition, msg, key))
-                    print('queue size: {}'.format(queue.qsize()))
-                except ValueError:
-                    print("Val: {}".format(val))
-                    raise
+                topic_partition, msg, key = next(all_messages)
             except StopIteration:
                 break
 
@@ -215,10 +197,6 @@ def _send_upstream(
                 'key': key,
                 'msg': msg,
             }
-        print("Created payloads:")
-        for req, data in request_tries.items():
-            print('request: {}'.format(req))
-            print('msg: {}, codec: {}, key: {}'.format(msg, codec, key))
 
         if not request_tries:
             continue
@@ -240,16 +218,10 @@ def _send_upstream(
 
         requests = list(request_tries.keys())
         log.debug('Sending: %s', requests)
-        print('About to send a produce request, client: {}'.format(client))
         responses = client.send_produce_request(requests,
                                                 acks=req_acks,
                                                 timeout=ack_timeout,
                                                 fail_on_error=False)
-        print("CALLS: {}".format(client.send_produce_request.call_count))
-        if isinstance(responses[0], (RETRY_ERROR_TYPES, RETRY_BACKOFF_ERROR_TYPES)):
-            print("ERROR")
-        else:
-            print("SUCCESS")
 
         log.debug('Received: %s', responses)
         for i, response in enumerate(responses):
@@ -307,9 +279,6 @@ def _send_upstream(
                     'partition': req.partition,
                     'msgs': [m[0] for m in msg],
                 })
-                print("key: {}, topic: {}, partition: {}, msg: {}".format(
-                    key, req.topic, req.partition, msg
-                ))
 
         request_tries = request_tries_filtered
 
@@ -322,7 +291,6 @@ def _send_upstream(
 
     # store messages that were put on retry but didn't have a chance to be
     # reprocessed
-    print("request tries: {}".format(len(request_tries.keys())))
     for req, req_value in request_tries.items():
         key = req_value['key']
         msg = req_value['msg']
