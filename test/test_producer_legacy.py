@@ -28,7 +28,6 @@ class ProccessRunnerMixin(object):
         super(ProccessRunnerMixin, self).setUp()
         self.client = MagicMock()
         self.queue = queue.Queue()
-        print('setUp()')
 
     def tearDown(self):
         super(ProccessRunnerMixin, self).tearDown()
@@ -56,11 +55,8 @@ class ProccessRunnerMixin(object):
                   stop_event))
         self.thread.daemon = True
         self.thread.start()
-        print('before sleep: ', dtime.now() - start)
         time.sleep(sleep_timeout)
-        print('after sleep: ', dtime.now() - start)
         stop_event.set()
-        print("Stop event is set!")
 
 
 class TestKafkaProducer(DisableUnsentStoringMixin, unittest.TestCase):
@@ -276,7 +272,6 @@ class TestKafkaProducerSendUpstream(
         self._run_process(2)
 
         # the queue should be void at the end of the test
-        print("Queue size: ", self.queue.qsize())
         self.assertEqual(self.queue.empty(), True)
 
         # there should be 5 non-void calls: 1st failed batch of 3 msgs

@@ -72,7 +72,8 @@ def _store_unsent_messages(failed_msgs):
         json.dump(failed_msgs[:FAILED_MSGS_MAXSIZE], f)
 
 
-@synchronized
+@synchronized  # we are writing unsent msgs to a file so we cannot afford to run
+# this in parallel
 def _send_upstream(
         queue, client, codec, batch_time, batch_size,
         req_acks, ack_timeout, retry_options, stop_event,
@@ -430,15 +431,6 @@ class Producer(object):
                 backoff_ms=async_retry_backoff_ms,
                 retry_on_timeouts=async_retry_on_timeouts)
             self.thread_stop_event = Event()
-            # _send_upstream(
-            #     self.queue, self.client.copy(), self.codec,
-            #     batch_send_every_t, batch_send_every_n,
-            #     self.req_acks, self.ack_timeout,
-            #     async_retry_options, self.thread_stop_event,
-            #     log_messages_on_error=async_log_messages_on_error,
-            #     stop_timeout=async_stop_timeout,
-            #     codec_compresslevel=self.codec_compresslevel
-            # )
             self.thread = Thread(
                 target=_send_upstream,
                 args=(self.queue, self.client.copy(), self.codec,
@@ -475,7 +467,7 @@ class Producer(object):
             partition (int): partition number for produce request
             *msg (bytes): one or more message payloads
 
-        Returns
+        Returns:
             ResponseRequest returned by server
 
         Raises:
