@@ -614,8 +614,7 @@ class Producer(object):
                 'key': kwargs.get('key'),
             } for msg in failed_msgs]
 
-            with open(KAFKA_UNSENT_FILE, 'w') as f:
-                json.dump(failed_msgs[:FAILED_MSGS_MAXSIZE], f)
+            _store_unsent_messages(failed_msgs)
 
     def stop(self, timeout=None):
         """

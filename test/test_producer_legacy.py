@@ -142,21 +142,21 @@ class TestKafkaProducer(DisableUnsentStoringMixin, unittest.TestCase):
 
     def test_producer_sync_fail_on_error(self):
         error = FailedPayloadsError('failure')
-        with patch.object(SimpleClient, 'load_metadata_for_topics'):
-            with patch.object(SimpleClient, 'ensure_topic_exists'):
-                with patch.object(SimpleClient, 'get_partition_ids_for_topic', return_value=[0, 1]):
-                    with patch.object(SimpleClient, '_send_broker_aware_request', return_value = [error]):
+        with patch.object(SimpleClient, 'load_metadata_for_topics'), \
+            patch.object(SimpleClient, 'ensure_topic_exists'), \
+            patch.object(SimpleClient, 'get_partition_ids_for_topic', return_value=[0, 1]), \
+            patch.object(SimpleClient, '_send_broker_aware_request', return_value=[error]):
 
-                        client = SimpleClient(MagicMock())
-                        producer = SimpleProducer(client, async_send=False, sync_fail_on_error=False)
+            client = SimpleClient(MagicMock())
+            producer = SimpleProducer(client, async_send=False, sync_fail_on_error=False)
 
-                        # This should not raise
-                        (response,) = producer.send_messages('foobar', b'test message')
-                        self.assertEqual(response, error)
+            # This should not raise
+            (response,) = producer.send_messages('foobar', b'test message')
+            self.assertEqual(response, error)
 
-                        producer = SimpleProducer(client, async_send=False, sync_fail_on_error=True)
-                        with self.assertRaises(FailedPayloadsError):
-                            producer.send_messages(b'foobar', b'test message')
+            producer = SimpleProducer(client, async_send=False, sync_fail_on_error=True)
+            with self.assertRaises(FailedPayloadsError):
+                producer.send_messages(b'foobar', b'test message')
 
     def test_cleanup_is_not_called_on_stopped_producer(self):
         producer = Producer(MagicMock(), async_send=True)
