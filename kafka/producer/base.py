@@ -507,7 +507,7 @@ class Producer(object):
             partition (int): partition number for produce request
             *msg (bytes): one or more message payloads
 
-        Returns:
+        Returns
             ResponseRequest returned by server
 
         Raises:
@@ -632,10 +632,9 @@ class Producer(object):
             log.warning('producer.stop() called, but producer is already stopped')
             return
 
-        if self.async_send:
-            self.queue.put((STOP_ASYNC_PRODUCER, None, None))
-            self.thread_stop_event.set()
-            self.thread.join()
+        self.queue.put((STOP_ASYNC_PRODUCER, None, None))
+        self.thread_stop_event.set()
+        self.thread.join()
 
         if hasattr(self, '_cleanup_func'):
             # Remove cleanup handler now that we've stopped
